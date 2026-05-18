@@ -1,0 +1,86 @@
+---
+title: "Single Protein Protein Expression Plot"
+output: html_document
+date: "2026-05-15"
+---
+```{r}
+library(tidyverse)
+
+library(ggplot2)
+
+library(gtools)
+
+library(tidyr)
+```
+
+```{r}
+CMBnr <- "CMB-2219_21_36"
+cells <- "NCI-H1975"
+output_folder <- paste0("results/",CMBnr)
+# Define your proteins of interest
+target_proteins <- c("P13647", "P02533", "P30740", "P13647", "P30740", "P48723", "O95833")
+```
+
+```{r}
+exp_design <- read.csv(paste0("Data/",CMBnr,"/Experimental_design_", CMBnr,".csv"), sep = ";") %>%
+  dplyr::select(Sample, Group, Replicate, Run) %>%
+
+  mutate(
+
+    passage_nr = as.integer(str_extract(Group, "[0-9]+$"))-1, #-1 as passage mistakenly starts at 1 in experimental design file
+
+    passage    = paste0("P", passage_nr)
+
+  )
+ 
+cat("Experimental Design (lookup-tabel):\n")
+
+print(exp_design, n = Inf)
+```
+
+```{r}
+protein_intensities <- read.csv(paste0("results/",CMBnr,"/Protein_Intensities_Wide.csv"))
+colnames(protein_intensities)[1] <- "Protein"
+```
+
+```{r}
+ 
+
+# Extract and reshape the data
+plot_data_single <- protein_intensities %>%
+  # Filter for target proteins
+  filter(Protein %in% target_proteins) %>%
+  pivot_longer(cols = -Protein, names_to = "Sample", values_to = "Intensity") %>%
+  mutate(Sample = sub("^X", "", Sample)) %>%
+  # Join with experimental design
+  left_join(exp_design, by = "Sample") %>%
+  mutate(passage = reorder(passage, passage_nr)) %>%
+  group_by(Protein) %>%
+  mutate(Z_Intensity = (Intensity - mean(Intensity, na.rm=TRUE)) / sd(Intensity, na.rm=TRUE)) %>%
+  ungroup()
+
+# Create the Line Plot
+p_single <- ggplot(plot_data_single, aes(x = passage, y = Z_Intensity, 
+                                           color = Protein, group = Protein)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Paired") +
+  labs(title = paste0("Protein Expression Profile of Q13938 ", cells),
+       subtitle = "Data Z-score scaled to show relative changes",
+       x = "Passage",
+       y = "Relative Expression") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 14, face = "bold")
+        )
+
+print(p_single)
+```
+
+```{r}
+ggsave(file.path(output_folder, paste0("protexpprof_", CMBnr, "_SHAP.png")), p_single, width = 10, height = 5)
+```
+
+
+

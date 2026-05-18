@@ -1,0 +1,856 @@
+---
+title: "Analysis2219_21_36"
+output: html_document
+date: "2026-04-25"
+---
+
+```{R}
+library(arrow)
+
+library(tidyverse)
+
+library(gtools)
+
+library(ggplot2)
+
+library(ggrepel)
+
+library(patchwork)
+
+library(limma)
+
+library(msqrob2)
+
+library(QFeatures)
+
+library(pheatmap)
+
+library(viridis)
+
+library(readxl)
+
+library(variancePartition)
+
+library(Rtsne)
+
+library(tibble)
+ 
+```
+
+```{r}
+# Variables
+CMBnr <- "CMB-2216"
+cells <- "NCI-H1650"
+output_folder <- paste0("results/",CMBnr)
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+passage_baseline  <- "P0"   # Reference passage
+passage_of_interest <- "P12"  # Passage to compare against baseline
+tag <- paste0(passage_of_interest, "_vs_", passage_baseline, "_", CMBnr)
+```
+
+```{r}
+# =============================================================================
+
+# 1. LOAD EXPERIMENTAL DESIGN
+
+# =============================================================================
+
+exp_design <- read.csv(paste0("Data/",CMBnr,"/Experimental_design_", CMBnr,".csv"), sep = ";") %>%
+  dplyr::select(Sample, Group, Replicate, Run) %>%
+
+  mutate(
+
+    passage_nr = as.integer(str_extract(Group, "[0-9]+$"))-1, #-1 as passage mistakenly starts at 1 in experimental design file
+
+    passage    = paste0("P", passage_nr)
+
+  )
+ 
+cat("Experimental Design (lookup-tabel):\n")
+
+print(exp_design, n = Inf)
+
+```
+
+```{r}
+# =============================================================================
+
+# 2. READ PARQUET AND FILTER
+
+# =============================================================================
+ 
+# READ PARQUET
+
+raw <- read_parquet(paste0("Data/",CMBnr,"/report.parquet"))
+ 
+raw_filtered <- raw %>%
+
+  dplyr::filter(Q.Value    <= 0.01,
+
+                PG.Q.Value <= 0.01,
+                
+                !grepl("cRAP", Protein.Group),
+                
+                !grepl("cRAP", Protein.Ids)
+                )%>%
+  dplyr::mutate(
+    # Keep only the lead ID
+    Protein.Group = sub(";.*", "", Protein.Group),
+    
+    Protein.Ids   = sub(";.*", "", Protein.Ids),
+  )
+ 
+cat(sprintf("\nRows after FDR- en cRAP-filter: %d (van %d)\n", nrow(raw_filtered), nrow(raw)))
+
+```
+
+```{r}
+# =============================================================================
+
+# 3. Preprocessing & Protein Aggregation
+
+# =============================================================================
+# join the data
+raw_filtered_annotated <- raw_filtered %>%
+  inner_join(exp_design, by = "Run")
+
+# define factor levels
+sample_levels <- mixedsort(unique(raw_filtered_annotated$Sample))
+
+# apply the factor
+raw_filtered_annotated$Sample <- factor(raw_filtered_annotated$Sample, 
+                                        levels = sample_levels)
+
+# reshape the data
+raw_wide <- raw_filtered_annotated %>%
+  select(Precursor.Id, Protein.Ids, Sample, Genes, Precursor.Quantity) %>%
+  pivot_wider(
+    names_from = Sample, 
+    values_from = Precursor.Quantity
+  ) %>%
+  select(Precursor.Id, Protein.Ids, Genes, all_of(as.character(sample_levels)))
+
+# identify which columns in diann_wide are the sample intensities
+intensity_cols <- exp_design$Sample
+
+# create the object
+pe <- readQFeatures(
+  raw_wide, 
+  ecol = intensity_cols, 
+  name = "precursor_raw", 
+  fnames = "Precursor.Id"
+  
+)
+
+```
+
+```{r}
+# filtering NA treshhold 70%
+rowData(pe[["precursor_raw"]])$nValid <- rowSums(!is.na(assay(pe[["precursor_raw"]])))
+threshold <- ncol(assay(pe[["precursor_raw"]])) * 0.7
+
+# calculate number of NAs per row
+n_na <- ncol(pe[["precursor_raw"]]) - rowData(pe[["precursor_raw"]])$nValid
+
+# plot the histogram
+hist(n_na, 
+     breaks = ncol(pe[["precursor_raw"]]), 
+     col = "steelblue", 
+     main = "Distribution of Missing Values",
+     xlab = "Number of Samples Missing Precursor", 
+     ylab = "Frequency (Number of Precursors)",
+     xlim = c(0, 50)
+       )
+
+# 70% threshold line
+abline(v = ncol(pe[["precursor_raw"]]) * 0.3, col = "red", lwd = 2, lty = 2)
+```
+
+```{r warning=FALSE}
+# apply filter
+pe <- filterFeatures(pe, ~ nValid >= threshold)
+
+# log transform (base 2)
+pe <- logTransform(pe, i = "precursor_raw", name = "precursor_log")
+
+# normalize (median centering)
+pe <- normalize(pe, i = "precursor_log", name = "precursor_norm", method = "center.median")
+
+# aggregate precursors to protein level
+pe <- aggregateFeatures(
+  pe, 
+  i = "precursor_norm", 
+  fcol = "Protein.Ids", 
+  name = "protein",
+  fun = MsCoreUtils::robustSummary
+)
+
+# Identify the number of proteins in the aggregated assay
+num_proteins <- nrow(pe[["protein"]])
+
+cat("Number of unique proteins after aggregation:", num_proteins, "\n")
+```
+
+```{r}
+# reorder the design
+correct_order <- match(colnames(pe[["precursor_raw"]]), exp_design$Sample)
+ordered_design <- exp_design[correct_order, ]
+
+# Set the row names of the metadata to match the sample names
+rownames(ordered_design) <- ordered_design$Sample
+
+# Assign to colData
+colData(pe) <- DataFrame(ordered_design)
+
+# Verify
+head(colData(pe))
+```
+
+```{r}
+# Passage as factor
+pe$passage <- factor(pe$passage, levels = mixedsort(unique(pe$passage)))
+
+head(colData(pe))
+```
+```{r}
+# Compare distributions of log-transformed vs. normalized data
+par(mfrow = c(1, 2))
+
+# Before: Log-transformed only
+limma::plotDensities(assay(pe[["precursor_log"]]), 
+                     main = "Before Normalisation", legend = FALSE)
+
+# After: Median Centered
+limma::plotDensities(assay(pe[["precursor_norm"]]), 
+                     main = "After Normalisation", legend = FALSE)
+```
+
+
+```{r}
+# Boxplots for all 39 samples
+boxplot(assay(pe[["precursor_norm"]]), 
+        main = "Normalized Intensities", 
+        las = 2, col = "skyblue", cex.axis = 0.7)
+abline(h = 0, col = "red", lwd = 2) # The median should sit on 0
+```
+
+```{R}
+# =============================================================================
+
+# 4. PCA PLOTS
+
+# =============================================================================
+# Create matrix for PCAs
+
+mat_pca   <- assay(pe, "protein")
+ 
+# Impute NA's
+
+mat_pca_imp <- apply(mat_pca, 2, function(x) {
+
+  x[is.na(x)] <- mean(x, na.rm = TRUE); x
+
+})
+ 
+# PCA
+
+pca     <- prcomp(t(mat_pca_imp), scale. = TRUE, center = TRUE)
+
+pct_var <- round(summary(pca)$importance[2, ] * 100, 1)
+ 
+pca_df <- as.data.frame(pca$x) %>%
+
+  rownames_to_column("Sample") %>%
+
+  left_join(dplyr::select(exp_design, Sample, passage, Replicate),
+
+            by = "Sample")
+ 
+# color palette
+
+nrofpassages <- max(exp_design$passage_nr, na.rm = TRUE)
+pal_passages <- setNames(scales::hue_pal()((nrofpassages+2)), paste0("P", 0:(nrofpassages+1)))
+
+#labeling 
+
+passage_levels <- paste0("P", 0:(nrofpassages+1))
+
+pca_df$passage <- factor(pca_df$passage, levels = passage_levels)
+```
+
+```{r}
+# PC1 vs PC2
+
+p_pca12 <- ggplot(pca_df,
+
+                  aes(x = PC1, y = PC2, color = passage, label = paste0(passage, ".", Replicate))) +
+
+  geom_point(size = 4, alpha = 0.9) +
+
+  geom_text_repel(size = 2.8, max.overlaps = 30, show.legend = FALSE) +
+
+  stat_ellipse(aes(group = passage), type = "norm",
+
+               linetype = "dashed", alpha = 0.35, show.legend = FALSE) +
+
+  scale_color_manual(values = pal_passages, name = "Passage") +
+
+  labs(
+
+    title    = paste0("PCA – ", cells),
+
+    subtitle = sprintf("%d proteins  |  %d samples",
+
+                       nrow(mat_pca), ncol(mat_pca)),
+
+    x = sprintf("PC1 (%.1f%%)", pct_var[1]),
+
+    y = sprintf("PC2 (%.1f%%)", pct_var[2])
+
+  ) +
+
+  theme_bw(base_size = 13) +
+
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+
+p_pca12
+
+```
+
+```{r}
+# PC1 vs PC3
+
+p_pca13 <- ggplot(pca_df,
+
+                  aes(x = PC1, y = PC3, color = passage, label = paste0(passage, ".", Replicate))) +
+
+  geom_point(size = 4, alpha = 0.9) +
+
+  geom_text_repel(size = 2.8, max.overlaps = 30, show.legend = FALSE) +
+
+  stat_ellipse(aes(group = passage), type = "norm",
+
+               linetype = "dashed", alpha = 0.35, show.legend = FALSE) +
+
+  scale_color_manual(values = pal_passages, name = "Passage") +
+
+  labs(
+
+    title    = paste0("PCA – ", cells),
+
+    subtitle = sprintf("%d proteins  |  %d samples",
+
+                       nrow(mat_pca), ncol(mat_pca)),
+    x = sprintf("PC1 (%.1f%%)", pct_var[1]),
+
+    y = sprintf("PC3 (%.1f%%)", pct_var[3])) +
+
+  theme_bw(base_size = 13) +
+
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+
+p_pca13
+
+```
+
+```{r}
+# scree plot
+
+scree_df <- data.frame(
+
+  PC  = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)),
+
+  Var = pct_var[1:10]
+
+)
+
+p_scree <- ggplot(scree_df, aes(x = PC, y = Var)) +
+
+  geom_col(fill = "steelblue", alpha = 0.8) +
+
+  geom_line(aes(group = 1), color = "firebrick", linewidth = 0.8) +
+
+  geom_point(color = "firebrick", size = 2) +
+
+  labs(title = paste0("Scree plot ", cells), x = NULL, y = "Variance explained (%)") +
+
+  theme_bw(base_size = 12) +
+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_scree
+
+```
+
+
+```{r}
+# get loadings of PCs 1, 2, and 3
+
+pc1_vals <- pca$rotation[, "PC1"]
+
+pc1_drivers_high <- head(sort(pc1_vals, decreasing = TRUE), 10)
+pc1_drivers_low <- head(sort(pc1_vals, decreasing = FALSE), 10)
+
+pc2_vals <- pca$rotation[, "PC2"]
+pc2_drivers_high <- head(sort(pc2_vals, decreasing = TRUE), 10)
+pc2_drivers_low <- head(sort(pc2_vals, decreasing = FALSE), 10)
+
+pc3_vals <- pca$rotation[, "PC3"]
+pc3_drivers_high <- head(sort(pc3_vals, decreasing = TRUE), 10)
+pc3_drivers_low <- head(sort(pc3_vals, decreasing = FALSE), 10)
+
+all_drivers_pc1 <- c(names(pc1_drivers_high), names(pc1_drivers_low))
+all_drivers_pc2 <- c(names(pc2_drivers_high), names(pc2_drivers_low))
+all_drivers_pc3 <- c(names(pc3_drivers_high), names(pc3_drivers_low))
+
+# save pc drivers to txt
+writeLines(all_drivers_pc1, con = paste0(output_folder, "/driverspc1_", CMBnr, ".txt"))
+writeLines(all_drivers_pc2, con = paste0(output_folder, "/driverspc2_", CMBnr, ".txt"))
+writeLines(all_drivers_pc3, con = paste0(output_folder, "/driverspc3_", CMBnr, ".txt"))
+
+```
+
+```{r}
+# =============================================================================
+ 
+# 5. tSNE PLOT
+ 
+# =============================================================================
+
+n_samples      <- ncol(mat_pca_imp)
+perplexity_val <- 10
+ 
+set.seed(42)
+tsne_result <- Rtsne(t(mat_pca_imp), 
+                     perplexity = perplexity_val, 
+                     verbose    = TRUE,
+                     pca        = TRUE,   
+                     check_duplicates = FALSE)
+ 
+tsne_df <- data.frame(
+  tSNE1 = tsne_result$Y[, 1],
+  tSNE2 = tsne_result$Y[, 2]
+) %>%
+  mutate(Sample = colnames(mat_pca_imp)) %>%
+  left_join(dplyr::select(exp_design, Sample, passage, Replicate), by = "Sample")
+ 
+tsne_df$passage <- factor(tsne_df$passage, levels = passage_levels)
+ 
+p_tsne <- ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, 
+                               color = passage, 
+                               label = paste0(passage, ".", Replicate))) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text_repel(size = 2.8, max.overlaps = 30, show.legend = FALSE) +
+  scale_color_manual(values = pal_passages, name = "Passage") +
+  labs(
+    title    = paste0("tSNE – ", cells),
+    subtitle = sprintf("%d proteins  |  %d samples",
+                       nrow(mat_pca_imp), ncol(mat_pca_imp)),
+    x = "tSNE 1",
+    y = "tSNE 2"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+ 
+p_tsne
+```
+
+```{r}
+# =============================================================================
+
+# 6. Variance Partition
+
+# =============================================================================
+# prepare data for variancePartition
+metadata_xl <- read_excel(paste0("Data/",CMBnr,"/extra_metadata.xlsx"))
+
+mat_vp <- mat_pca_imp
+info_vp <- exp_design %>%
+  left_join(metadata_xl, by = "passage_nr")
+
+# set the row names using the 'sample' column
+rownames(info_vp) <- info_vp$Sample
+
+# remove the 'sample' column so only numeric data remains
+info_vp$Sample <- NULL
+
+info_vp <- info_vp %>%
+  mutate(across(c(passage, operator, splitting_ratio), as.factor))
+
+```
+
+
+```{r}
+# define formula for variancePartition
+form <- ~ (1 | passage) + (1 | operator) + (1 | splitting_ratio)
+
+```
+
+```{r}
+varPart <- fitExtractVarPartModel(mat_vp, form, info_vp)
+
+# sort variables (i.e. columns) by median fraction of variance explained
+vp <- sortCols(varPart)
+
+# violin plot of contribution of each variable to total variance
+vpplot <- plotVarPart(vp)
+
+# add title
+vpplot <- vpplot + 
+  ggtitle(paste0("Variance Partition ", cells)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 18, face = "bold"))
+
+vpplot
+```
+```{r}
+# Calculate the median percentage of variance explained for each variable
+vp_summary <- colMeans(varPart) * 100
+vp_medians <- apply(varPart, 2, median) * 100
+
+# Combine into a clean table for your thesis
+summary_table <- data.frame(
+  Variable = names(vp_summary),
+  Median_Percent = round(vp_medians, 2)
+) %>%
+  arrange(desc(Median_Percent))
+
+print(summary_table)
+```
+
+```{r warning=FALSE}
+# =============================================================================
+
+# 7. Differential Expression Analysis
+
+# =============================================================================
+# --- TREND ANALYSIS BRANCH ---
+pe_trend <- pe
+pe_trend <- msqrob(pe_trend, i = "protein", formula = ~passage_nr, overwrite = TRUE)
+L_trend <- makeContrast("passage_nr = 0", 
+                        parameterNames = colnames(model.matrix(~passage_nr, colData(pe_trend))))
+pe_trend <- hypothesisTest(pe_trend, i = "protein", contrast = L_trend)
+
+# --- PAIRWISE ANALYSIS BRANCH ---
+pe_pair <- pe
+pe_pair <- msqrob(pe_pair, i = "protein", formula = ~passage, overwrite = TRUE)
+
+contrast_name <- paste0("passage", passage_of_interest)
+contrast_str  <- paste0(contrast_name, " = 0")
+
+L_pair <- makeContrast(contrast_str,
+                       parameterNames = colnames(model.matrix(~passage, colData(pe_pair))))
+pe_pair <- hypothesisTest(pe_pair, i = "protein", contrast = L_pair)
+
+```
+
+
+```{r}
+# Extract Pairwise
+gene_lookup <- as.data.frame(rowData(pe_pair[[1]])) %>% 
+  dplyr::select(Protein.Ids, Genes) %>%
+  distinct()
+
+res_pair <- rowData(pe_pair[["protein"]])[[contrast_name]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein.Ids") %>%
+  left_join(gene_lookup, by = "Protein.Ids") %>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", Protein.Ids, Genes)) %>%
+  mutate(Protein = Protein.Ids)
+
+# --- VOLCANO PLOT ---
+p_cutoff <- 0.05
+fc_cutoff <- 1
+
+plot_title <- paste("Volcano Plot:", cells, passage_of_interest, "vs", passage_baseline)
+
+p_volcano <- ggplot(res_pair, aes(x = logFC, y = -log10(adjPval))) +
+  geom_point(aes(color = (adjPval < p_cutoff & abs(logFC) > fc_cutoff)), alpha = 0.5) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed") +
+  geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed") +
+  geom_text_repel(
+    data = res_pair %>% filter(adjPval < p_cutoff & abs(logFC) > fc_cutoff),
+    aes(label = Genes),
+    size = 3,
+    max.overlaps = 12
+  ) +
+  theme_classic() +
+  labs(title = plot_title,
+       x = "Log2 Fold Change", y = "-log10(Adjusted P-value)",
+       color = "Significant") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"))
+
+print(p_volcano)
+```
+
+```{r}
+
+# Extract Trend (Slope across all passages)
+res_trend <- rowData(pe_trend[["protein"]])$passage_nr %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein.Ids") %>%
+  left_join(gene_lookup, by = "Protein.Ids") %>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", Protein.Ids, Genes))
+
+# --- HEATMAP ---
+top_trend_data <- res_trend %>%
+  arrange(adjPval) %>%
+  head(30)
+
+top_trend_ids <- top_trend_data$Protein.Ids
+top_gene_labels <- top_trend_data$Genes
+
+
+heatmap_data   <- assay(pe_trend[["protein"]])[top_trend_ids, ]
+colnames(heatmap_data) <- paste0("P", colData(pe_trend)$passage_nr,
+                                  "_",
+                                  sub(".*_", "", rownames(colData(pe_trend))))
+
+heatmap_scaled <- t(scale(t(heatmap_data)))
+
+heatmap_title <- paste(paste0("Top ", length(top_trend_ids) ," Proteins by Longitudinal Trend ", cells))
+
+p_heatmap <- pheatmap(heatmap_scaled,
+              cluster_cols = FALSE,
+              show_colnames = TRUE,
+              show_rownames = TRUE,
+              labels_row = top_gene_labels,
+              color = viridis(100),
+              main = heatmap_title,
+              border_color = NA,
+              fontsize_row = 8)
+
+```
+
+
+```{r}
+# --- Define Basic Significant Sets with Direction ---
+
+# --- DIRECTIONAL PROTEIN SETS ---
+trend_up   <- res_trend %>% filter(adjPval < 0.05, logFC > 0) %>% pull(Protein.Ids)
+trend_down <- res_trend %>% filter(adjPval < 0.05, logFC < 0) %>% pull(Protein.Ids)
+pair_up    <- res_pair  %>% filter(adjPval < 0.05, logFC >  fc_cutoff) %>% pull(Protein)
+pair_down  <- res_pair  %>% filter(adjPval < 0.05, logFC < -fc_cutoff) %>% pull(Protein)
+
+both_up        <- intersect(trend_up,   pair_up)
+both_down      <- intersect(trend_down, pair_down)
+all_sig <- unique(c(trend_up, trend_down, pair_up, pair_down))
+  
+
+background_list <- rownames(pe_pair[["protein"]])
+
+print(paste0("# Both up: ", length(both_up)))
+print(paste0("# Both down: ", length(both_down)))
+print(paste0("# Pair up: ", length(pair_up)))
+print(paste0("# Pair down: ", length(pair_down)))
+print(paste0("# Trend up: ", length(trend_up)))
+print(paste0("# Trend down: ", length(trend_down)))
+print(paste0("# Total: ", length(all_sig)))
+```
+
+```{r}
+# =============================================================================
+
+# 8. Protein Expression Profile Plots
+
+# =============================================================================
+
+#--- Line Plot trend---
+
+# Slice the top 10 rows (Unchanged)
+top_10_data <- res_trend %>%
+  arrange(adjPval) %>%
+  head(10) %>%
+  mutate(Genes = make.unique(Genes))
+
+top_10_ids <- top_10_data$Protein.Ids
+top_intensities <- assay(pe, "protein")[top_10_ids, ]
+
+# Build the data frame
+plot_data <- as.data.frame(top_intensities) %>%
+  mutate(Protein.Ids = rownames(.)) %>%
+  pivot_longer(cols = -Protein.Ids, names_to = "Sample", values_to = "Intensity") %>%
+  left_join(as.data.frame(colData(pe)), by = "Sample") %>%
+  left_join(dplyr::select(top_10_data, Protein.Ids, Genes), by = "Protein.Ids")
+
+
+unique_passages <- unique(plot_data$passage)
+correct_order <- unique_passages[order(as.numeric(gsub("[^0-9]", "", unique_passages)))]
+
+plot_data <- plot_data %>%
+  mutate(passage = factor(passage, levels = correct_order)) %>%
+  group_by(Protein.Ids) %>%
+  mutate(Z_Intensity = (Intensity - mean(Intensity, na.rm=TRUE)) / sd(Intensity, na.rm=TRUE)) %>%
+  ungroup()
+
+# Generate the profile plot
+p_unified <- ggplot(plot_data, aes(x = passage, y = Z_Intensity, 
+                                   color = Genes, group = Protein.Ids)) + 
+  stat_summary(fun = mean, geom = "line", size = 1.2, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Paired") + 
+  labs(title = paste0("Protein Expression Profile of Top 10 Trend Proteins ", cells),
+       subtitle = "Data Z-score scaled to show relative changes",
+       x = "Passage",
+       y = "Relative Expression",
+       color = "Protein") + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 14, face = "bold")
+  )
+
+p_unified
+```
+
+```{r}
+# --- Line Plot PC drivers---
+driver_ids <- names(pc1_drivers_high)
+
+driver_mapping <- data.frame(Protein.Ids = driver_ids) %>%
+  left_join(gene_lookup, by = "Protein.Ids") %>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", Protein.Ids, Genes)) %>%
+  mutate(Genes = make.unique(Genes))
+
+driver_intensities <- assay(pe, "protein")[driver_ids, ]
+
+plot_data_drivers <- as.data.frame(driver_intensities) %>%
+  mutate(Protein.Ids = rownames(.)) %>%
+  pivot_longer(cols = -Protein.Ids, names_to = "Sample", values_to = "Intensity") %>%
+  left_join(as.data.frame(colData(pe)), by = "Sample") %>%
+  left_join(driver_mapping, by = "Protein.Ids")
+
+unique_passages_dr <- unique(plot_data_drivers$passage)
+correct_order_dr <- unique_passages_dr[order(as.numeric(gsub("[^0-9]", "", unique_passages_dr)))]
+
+plot_data_drivers <- plot_data_drivers %>%
+  mutate(passage = factor(passage, levels = correct_order_dr)) %>%
+  group_by(Protein.Ids) %>%
+  mutate(Z_Intensity = (Intensity - mean(Intensity, na.rm=TRUE)) / sd(Intensity, na.rm=TRUE)) %>%
+  ungroup()
+
+# Generate the driver line plot
+p_line_high <- ggplot(plot_data_drivers, aes(x = passage, y = Z_Intensity, 
+                                             color = Genes, group = Protein.Ids)) + 
+  stat_summary(fun = mean, geom = "line", size = 1.2, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Paired") + 
+  labs(title = paste0("Protein Expression Profile of 10 Most Negative PC1 Drivers ", cells),
+       subtitle = "Data Z-score scaled to show relative changes",
+       x = "Passage",
+       y = "Relative Expression",
+       color = "Protein") + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 14, face = "bold"))
+
+p_line_high
+```
+
+```{r}
+# --- Line Plot PC drivers---
+driver_ids <- names(pc1_drivers_low)
+
+driver_mapping <- data.frame(Protein.Ids = driver_ids) %>%
+  left_join(gene_lookup, by = "Protein.Ids") %>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", Protein.Ids, Genes)) %>%
+  mutate(Genes = make.unique(Genes))
+
+driver_intensities <- assay(pe, "protein")[driver_ids, ]
+
+plot_data_drivers <- as.data.frame(driver_intensities) %>%
+  mutate(Protein.Ids = rownames(.)) %>%
+  pivot_longer(cols = -Protein.Ids, names_to = "Sample", values_to = "Intensity") %>%
+  left_join(as.data.frame(colData(pe)), by = "Sample") %>%
+  left_join(driver_mapping, by = "Protein.Ids")
+
+unique_passages_dr <- unique(plot_data_drivers$passage)
+correct_order_dr <- unique_passages_dr[order(as.numeric(gsub("[^0-9]", "", unique_passages_dr)))]
+
+plot_data_drivers <- plot_data_drivers %>%
+  mutate(passage = factor(passage, levels = correct_order_dr)) %>%
+  group_by(Protein.Ids) %>%
+  mutate(Z_Intensity = (Intensity - mean(Intensity, na.rm=TRUE)) / sd(Intensity, na.rm=TRUE)) %>%
+  ungroup()
+
+# Generate the driver line plot
+p_line_low <- ggplot(plot_data_drivers, aes(x = passage, y = Z_Intensity, 
+                                             color = Genes, group = Protein.Ids)) + 
+  stat_summary(fun = mean, geom = "line", size = 1.2, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Paired") + 
+  labs(title = paste0("Protein Expression Profile of 10 Most Negative PC1 Drivers ", cells),
+       subtitle = "Data Z-score scaled to show relative changes",
+       x = "Passage",
+       y = "Relative Expression",
+       color = "Protein") + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 14, face = "bold"))
+
+p_line_low
+```
+
+```{r}
+# =============================================================================
+
+# 9. Exporting
+
+# =============================================================================
+
+# --- EXPORT TAG---
+tag <- paste0(passage_of_interest, "_vs_", passage_baseline)
+
+# --- DEFINE OUTPUT PATHS ---
+base_dir  <- paste0("results/", CMBnr, "/", tag)
+plot_dir  <- paste0(base_dir, "/plots")
+dea_dir   <- paste0(base_dir, "/dea_lists")
+
+# --- CREATE FOLDERS IF THEY DON'T EXIST ---
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(dea_dir,  recursive = TRUE, showWarnings = FALSE)
+
+# --- SAVING PLOTS ---
+png(paste0(plot_dir, "/Volcano_", tag, ".png"),
+    width = 10, height = 8, units = "in", res = 300)
+print(p_volcano)
+dev.off()
+
+png(paste0(plot_dir, "/Heatmap_Trend_", CMBnr, ".png"),
+    width = 12, height = 14, units = "in", res = 300)
+print(p_heatmap)
+dev.off()
+
+ggsave(file.path(output_folder, paste0("pca12_", CMBnr, ".png")), p_pca12, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("pca13_", CMBnr, ".png")), p_pca13, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("scree_", CMBnr, ".png")), p_scree, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("vpplot_", CMBnr, ".png")), vpplot, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("tsne_", CMBnr, ".png")), p_tsne, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("top10protevo_", CMBnr, ".png")), p_unified, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("pchighevo_", CMBnr, ".png")), p_line_high, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("pclowevo_", CMBnr, ".png")), p_line_low, width = 10, height = 5)
+
+cat(paste0("Plots saved as png\n"), create.dir = TRUE)
+
+# --- SAVE DEA LISTS ---
+writeLines(both_up,         paste0(dea_dir, "/Consistent_UP_",      tag, ".txt"))
+writeLines(both_down,       paste0(dea_dir, "/Consistent_Down_",    tag, ".txt"))
+writeLines(trend_up,   paste0(dea_dir, "/Trend_UP_",      tag, ".txt"))
+writeLines(trend_down, paste0(dea_dir, "/Trend_DOWN_",    tag, ".txt"))
+writeLines(pair_up,    paste0(dea_dir, "/Pair_UP_",       tag, ".txt"))
+writeLines(pair_down,  paste0(dea_dir, "/Pair_DOWN_",     tag, ".txt"))
+writeLines(all_sig,  paste0(dea_dir, "/All_Sig_",     tag, ".txt"))
+writeLines(background_list, paste0(dea_dir, "/Study_Background_",   tag, ".txt"))
+
+# --- SAVE PROTEIN INTENSITIES ---
+# Extract the intensity matrix
+export_table <- assay(pe, "protein")
+
+# Save to CSV
+write.csv(export_table, paste0("results/", CMBnr,"/Protein_Intensities_Wide.csv"), row.names = TRUE)
+
+```

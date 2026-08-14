@@ -1,0 +1,1236 @@
+---
+title: "Analysis2216"
+output: html_document
+date: "2026-04-25"
+---
+
+```{R}
+library(arrow)
+
+library(tidyverse)
+
+library(gtools)
+
+library(ggplot2)
+
+library(ggrepel)
+
+library(patchwork)
+
+library(limma)
+
+library(msqrob2)
+
+library(QFeatures)
+
+library(pheatmap)
+
+library(viridis)
+
+library(readxl)
+
+library(variancePartition)
+
+library(Rtsne)
+
+library(tibble)
+
+library(ggforce)
+
+library(dplyr)
+
+library(stringr)
+
+library(imputeLCMD)
+ 
+```
+
+```{r}
+# Variables
+CMBnr <- "CMB-2216"
+cells <- "NCI-H1650"
+output_folder <- paste0("Datasets/results/",CMBnr)
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+passage_baseline  <- "P0"   # Reference passage
+passage_of_interest <- "P11"  # Passage to compare against baseline
+tag <- paste0(passage_of_interest, "_vs_", passage_baseline, "_", CMBnr)
+```
+
+```{r}
+# =============================================================================
+
+# 1. LOAD EXPERIMENTAL DESIGN & STATS FILE
+
+# =============================================================================
+exp_design <- read.csv(paste0("Datasets/",CMBnr,"/Experimental_design_", CMBnr,".csv"), sep = ";") %>%
+  dplyr::select(Sample, Group, Replicate, Injection_Order, Run) %>%
+  
+  mutate(
+    passage_nr = as.integer(str_extract(Group, "[0-9]+$"))-1, #-1 as passage mistakenly starts at 1 in experimental design file
+    passage    = paste0("P", passage_nr)
+  )
+
+cat("Experimental Design (lookup-tabel):\n")
+statsfile <- read_tsv(paste0("Datasets/",CMBnr,"/report.stats.tsv"))
+print(exp_design)
+
+```
+
+```{r}
+# =============================================================================
+
+# 2. READ PARQUET AND FILTER
+
+# =============================================================================
+ 
+# READ PARQUET
+
+raw <- read_parquet(paste0("Datasets/",CMBnr,"/report.parquet"))
+ 
+```
+
+```{r}
+# =============================================================================
+
+# 3. SAMPLE QC (PEPTIDE LENGTH DISTRIBUTION, TRYPTIC EFFICIENCY, CHARGE STATE, PRECURSOR IDENTIFICATION)
+
+# =============================================================================
+
+data_qc <- raw %>%
+  inner_join(exp_design, by = "Run") %>%
+  mutate(
+    passage = paste0(passage, "_", Replicate),
+    
+    # Peptide Length Calculation
+    Peptide_Length = nchar(Stripped.Sequence),
+    
+    # Missed Cleavages (Trypsin)
+    Internal_Seq = stringr::str_sub(Stripped.Sequence, start = 1, end = -2),
+    Missed_Cleavages = stringr::str_count(Internal_Seq, "[KR](?!P)"),
+    Missed_Cleavages = ifelse(Missed_Cleavages >= 2, "2", as.character(Missed_Cleavages)),
+    Missed_Cleavages = factor(Missed_Cleavages, levels = c("2", "1", "0")),
+    
+    # Precursor Charge State
+    Precursor.Charge = as.factor(Precursor.Charge)
+  )
+
+unique_passages <- unique(data_qc$passage)
+passage_nums <- as.numeric(stringr::str_extract(unique_passages, "(?<=P)\\d+"))
+replicate_nums <- as.numeric(stringr::str_extract(unique_passages, "\\d+$"))
+correct_order <- unique_passages[order(passage_nums, replicate_nums)]
+
+data_qc <- data_qc %>%
+  mutate(passage = factor(passage, levels = correct_order)) %>%
+  select(passage, Stripped.Sequence, Precursor.Charge, Precursor.Id, Peptide_Length, Missed_Cleavages)
+```
+
+```{r}
+# Peptide Length Distribution
+
+# Plot overlaid density curves to check for a uniform distribution shape
+p_peptidelength <- ggplot(data_qc, aes(x = Peptide_Length, color = passage)) +
+  geom_density(adjust = 2, alpha = 0.1, size = 0.8) +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(5, 35, by = 5), limits = c(5, 35)) + 
+  labs(title = "Peptide Length Distribution Comparison",
+       subtitle = "Overlaid profiles to check for consistent digestion across runs",
+       x = "Peptide Length (Amino Acids)",
+       y = "Density",
+       color = "Passage") +
+  
+  # Force a 3-column legend grid
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 1.2))) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 7.5), 
+    legend.key.size = unit(0.3, "cm"),                 
+    legend.spacing.x = unit(0.1, "cm"),                
+    legend.spacing.y = unit(0.05, "cm"),               
+    legend.margin = margin(t = 0, r = 0, b = 0, l = 0) 
+  )
+
+print(p_peptidelength)
+```
+
+```{r}
+#Missed cleavages (Stacked Bar Chart)
+
+# Calculate percentages per unique run
+cleavage_percentages <- data_qc %>%
+  group_by(passage, Missed_Cleavages) %>%
+  tally() %>%
+  mutate(Percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+# Generate the Stacked Bar Chart
+p_cleavage <- ggplot(cleavage_percentages, aes(x = passage, y = Percentage, fill = Missed_Cleavages)) +
+  geom_col(position = "stack", width = 0.7) +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2") + 
+  labs(title = "Tryptic Digestion Efficiency Per Run",
+       subtitle = "Proportion of missed cleavage sites across samples",
+       x = "Passage",
+       y = "Percentage of Peptides (%)",
+       fill = "Missed Cleavages") +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "right",
+    legend.title = element_text(size = 8)
+  )
+
+print(p_cleavage)
+
+```
+
+```{r}
+# Charge State (Stacked Bar Chart)
+
+# Count the occurrences of each charge state per unique run
+
+charge_qc <- data_qc %>%
+
+  group_by(passage, Precursor.Charge) %>%
+
+  tally() %>%
+
+  mutate(Percentage = n / sum(n) * 100,
+
+         Precursor.Charge = factor(Precursor.Charge, levels = c("4", "3", "2", "1"))
+
+         )
+
+
+# Create a stacked percentage bar chart
+
+p_charge <- ggplot(charge_qc, aes(x = passage, y = Percentage, fill = Precursor.Charge)) +
+
+  geom_col(position = "stack") +
+
+  theme_minimal() +
+
+  scale_fill_brewer(palette = "Set2") +
+
+  labs(title = "Precursor Charge State Distribution",
+
+       x = "Passage",
+
+       y = "Percentage (%)",
+
+       fill = "Charge State") +
+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+
+        plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+
+        legend.title = element_text(size = 8))
+
+print(p_charge)
+
+```
+
+```{r}
+#Combined Box Plot for Tryptic Efficiency, Charge State, and Number of Precursors Identified
+
+# Outlier Detection Function
+find_outliers <- function(x, labels) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  is_out <- x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr)
+  return(ifelse(is_out, as.character(labels), NA))
+}
+
+# Tryptic Digestion Efficiency
+digestion_index <- data_qc %>%
+  mutate(Missed_Numeric = as.numeric(as.character(Missed_Cleavages))) %>%
+  group_by(passage) %>%
+  summarise(Avg_Missed_Cleavages = mean(Missed_Numeric, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(outlier_label = find_outliers(Avg_Missed_Cleavages, passage))
+
+p1 <- ggplot(digestion_index, aes(x = "", y = Avg_Missed_Cleavages)) +
+  geom_boxplot(outlier.shape = NA, fill = "#2a9d8f", alpha = 0.4, width = 0.4) +
+  geom_point(color = "#264653", alpha = 0.7, size = 2.5) + 
+  geom_text_repel(aes(label = outlier_label), na.rm = TRUE, min_segment_length = 0,
+                  box.padding = 0.5, fontface = "bold", color = "firebrick", nudge_x = 0.4) +
+  theme_minimal() +
+  labs(
+    title = "Tryptic Digestion Efficiency",
+    x = NULL,
+    y = "Mean Missed Cleavages per Peptide"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+# Precursor Charge State
+charge_index <- data_qc %>%
+  mutate(Charge_Numeric = as.numeric(as.character(Precursor.Charge))) %>%
+  group_by(passage) %>%
+  summarise(Avg_Charge = mean(Charge_Numeric, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(outlier_label = find_outliers(Avg_Charge, passage))
+
+p2 <- ggplot(charge_index, aes(x = "", y = Avg_Charge)) +
+  geom_boxplot(outlier.shape = NA, fill = "#e76f51", alpha = 0.4, width = 0.4) +
+  geom_point(color = "#264653", alpha = 0.7, size = 2.5) + 
+  geom_text_repel(aes(label = outlier_label), na.rm = TRUE, min_segment_length = 0,
+                  box.padding = 0.5, fontface = "bold", color = "firebrick", nudge_x = 0.4) +
+  theme_minimal() +
+  labs(
+    title = "Precursor Charge State",
+    x = NULL,
+    y = "Mean Charge State per Precursor"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+# Number of Precursor IDs 
+precursor_data <- exp_design %>%
+  left_join(
+    statsfile %>% 
+      mutate(
+        Clean_Run_Name = sub("\\.raw$", "", basename(File.Name))
+      ) %>% 
+      select(Clean_Run_Name, Precursors.Identified),
+    by = c("Run" = "Clean_Run_Name")) %>%
+  mutate(passage = paste0(passage, "_", Replicate),
+         outlier_label = find_outliers(Precursors.Identified, passage)
+         )
+
+p3 <- ggplot(precursor_data, aes(x = "", y = Precursors.Identified)) +
+  geom_boxplot(outlier.shape = NA, fill = "#e76f51", alpha = 0.4, width = 0.4) +
+  geom_point(color = "#264653", alpha = 0.7, size = 2.5) + 
+  geom_text_repel(aes(label = outlier_label), na.rm = TRUE, min_segment_length = 0,
+                  box.padding = 0.5, fontface = "bold", color = "firebrick", nudge_x = 0.4) +
+  theme_minimal() +
+  labs(
+    title = "Precursor Identification",
+    x = NULL,
+    y = "Number of Identified Precursors"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+# Box Plot Combination
+p_combined_qc_dashboard <- p1 | p2 | p3
+
+p_combined_qc_dashboard <- p_combined_qc_dashboard + 
+  plot_annotation(
+    title = "Outlier Detection in Quality Control Boxplots of Cell Line NCI-H1650",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, face = "italic")
+    )
+  )
+
+print(p_combined_qc_dashboard)
+```
+
+```{r}
+# 1. Calculate the overall cohort mean and standard deviation
+cohort_stats <- digestion_index %>%
+  summarise(
+    Cohort_Mean = mean(Avg_Missed_Cleavages, na.rm = TRUE),
+    Cohort_SD   = sd(Avg_Missed_Cleavages, na.rm = TRUE)
+  )
+
+print(cohort_stats)
+
+```
+
+```{r}
+#Missingness Calculation
+# 1. Determine the total "Universe" of unique precursors (Sequence)
+total_global_precursors <- raw %>%
+  distinct(Precursor.Id) %>%
+  nrow()
+
+# 2. Pipeline to calculate missingness percentage per sample
+sample_missingness <- data_qc %>%
+  # Isolate unique precursors identified within each individual sample
+  distinct(passage, Precursor.Id) %>%
+  
+  # Group by your ordered passage factor
+  group_by(passage) %>%
+  
+  # Count present features and calculate what percentage of the global universe is missing
+  summarise(
+    precursors_present = n(),
+    missing = total_global_precursors - precursors_present,
+    missingness_percentage = (missing / total_global_precursors) * 100
+  ) %>%
+  ungroup()
+
+# Inspect your per-sample quality metrics
+print(sample_missingness)
+
+# 3. Summary statistics across all samples (mean, SD, range)
+sample_missingness_summary <- sample_missingness %>%
+  summarise(
+    mean_missingness   = mean(missingness_percentage, na.rm = TRUE),
+    sd_missingness      = sd(missingness_percentage, na.rm = TRUE),
+    min_missingness      = min(missingness_percentage, na.rm = TRUE),
+    max_missingness      = max(missingness_percentage, na.rm = TRUE),
+    range_missingness    = max_missingness - min_missingness
+  )
+
+print(sample_missingness_summary)
+
+# 4. Outlier detection (IQR method, consistent with your combined QC dashboard)
+find_outliers <- function(x, labels) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  is_out <- x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr)
+  return(ifelse(is_out, as.character(labels), NA))
+}
+
+sample_missingness <- sample_missingness %>%
+  mutate(outlier_label = find_outliers(missingness_percentage, passage))
+
+# Print flagged outliers only
+sample_missingness %>%
+  filter(!is.na(outlier_label)) %>%
+  print()
+
+```
+
+```{r}
+# Scatter plot to identify a possible trend in precursor identification
+# Sort the data by injection order
+scatter_data <- precursor_data %>%
+  arrange(Injection_Order)
+
+# Compute the Linear Model
+drift_model <- lm(Precursors.Identified ~ Injection_Order, data = scatter_data)
+r_squared   <- summary(drift_model)$r.squared
+r2_string   <- paste0("R² = ", round(r_squared, 3))
+
+# Scatter plot
+p_driftscatter <- ggplot(scatter_data, aes(x = Injection_Order, y = Precursors.Identified)) +
+  # Linear trend line with a 95% confidence interval ribbon
+  geom_smooth(method = "lm", formula = y ~ x, color = "#2a9d8f", fill = "#2a9d8f", alpha = 0.15, linewidth = 1) +
+  
+  geom_point(color = "#264653", size = 2.5, alpha = 0.8) +
+  
+  theme_minimal() +
+
+  scale_x_continuous(
+    breaks = scatter_data$Injection_Order,
+    labels = paste0("#", scatter_data$Injection_Order, " (", scatter_data$passage, ")")
+  ) +
+  
+  labs(
+    title = "Mass Spectrometer Signal Drift Analysis",
+    subtitle = paste0("Identification stability across acquisition timeline\n(", r2_string, ")"),
+    x = "Injection Sequence (Technical Passage)",
+    y = "Identified Precursor Count"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5, margin = margin(b = 3)),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, face = "italic", color = "gray25", margin = margin(b = 22)),
+    
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_driftscatter)
+```
+```{r}
+# Save Quality Control Plots
+
+ggsave(file.path(output_folder, paste0("peptidelength_", CMBnr, ".png")), p_peptidelength, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("missedcleavage_", CMBnr, ".png")), p_cleavage, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("chargestate_", CMBnr, ".png")), p_charge, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("qcboxplots_", CMBnr, ".png")), p_combined_qc_dashboard, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("driftscatter_", CMBnr, ".png")), p_driftscatter, width = 10, height = 5)
+
+cat(paste0("Plots saved as png\n"), create.dir = TRUE)
+
+```
+
+```{r}
+# =============================================================================
+
+# 4. PREPROCESSING & PROTEIN AGGREGATION
+
+# =============================================================================
+
+# Outlier Removal 
+
+remove_outliers <- TRUE         # set FALSE if you want with outliers
+outlier_passages <- c("P12")    # Add more passages if needed, see QC
+
+if (remove_outliers) {
+
+  # Find all Run IDs belonging to the outlier passage(s)
+  outlier_runs <- exp_design %>%
+    dplyr::filter(passage %in% outlier_passages) %>%
+    dplyr::pull(Run)
+
+  # Remove these runs from the experimental design
+  exp_design <- exp_design %>%
+    dplyr::filter(!Run %in% outlier_runs)
+
+} else {
+  outlier_runs <- character(0)
+}
+
+# Filtering
+
+raw_filtered <- raw %>%
+  dplyr::filter(
+    !Run %in% outlier_runs,     # Remove all outlier runs !! BEFORE filtering
+    Q.Value    <= 0.01,
+    PG.Q.Value <= 0.01,
+    !grepl("cRAP", Protein.Group),
+    !grepl("cRAP", Protein.Ids)
+  ) %>%
+  dplyr::mutate(
+    Protein.Group = sub(";.*", "", Protein.Group),
+    Protein.Ids   = sub(";.*", "", Protein.Ids)
+  )
+
+cat(sprintf(
+  "\nRows after outlier, FDR and cRAP filtering: %d (van %d)\n",
+  nrow(raw_filtered), nrow(raw)
+))
+```
+
+```{r}
+# Join the data
+raw_filtered_annotated <- raw_filtered %>%
+  inner_join(exp_design, by = "Run")
+
+# Define factor levels
+sample_levels <- mixedsort(unique(raw_filtered_annotated$Sample))
+
+# Apply the factor
+raw_filtered_annotated$Sample <- factor(raw_filtered_annotated$Sample, 
+                                        levels = sample_levels)
+
+# Reshape the data
+raw_wide <- raw_filtered_annotated %>%
+  select(Precursor.Id, Protein.Ids, Sample, Genes, Precursor.Quantity) %>%
+  pivot_wider(
+    names_from = Sample, 
+    values_from = Precursor.Quantity
+  ) %>%
+  select(Precursor.Id, Protein.Ids, Genes, all_of(as.character(sample_levels)))
+
+# Identify which columns in diann_wide are the sample intensities
+intensity_cols <- exp_design$Sample
+
+# Create the object
+pe <- readQFeatures(
+  raw_wide, 
+  ecol = intensity_cols, 
+  name = "precursor_raw", 
+  fnames = "Precursor.Id"
+  
+)
+
+```
+```{r}
+# filtering NA treshold 70%
+rowData(pe[["precursor_raw"]])$nValid <- rowSums(!is.na(assay(pe[["precursor_raw"]])))
+threshold <- ncol(assay(pe[["precursor_raw"]])) * 0.7
+
+n_samples <- ncol(pe[["precursor_raw"]])
+pct_valid <- (rowSums(!is.na(assay(pe[["precursor_raw"]]))) / n_samples) * 100
+
+# Set breaks to n_samples + 1 so each bin corresponds to exactly 1 sample count
+hist(pct_valid, 
+     breaks = seq(0, 100, length.out = n_samples + 1), 
+     col = "steelblue", 
+     main = "Sample Completeness per Precursor",
+     xlab = "Percentage of Samples Containing Precursor (%)", 
+     ylab = "Frequency (Number of Precursors)",
+     xlim = c(0, 100),
+     xaxt = "n"
+)
+
+# Custom 10% step axis and 70% cutoff line
+axis(1, at = seq(0, 100, by = 10))
+abline(v = 70, col = "red", lwd = 2, lty = 2)
+```
+
+```{r warning=FALSE}
+# Apply filter
+pe <- filterFeatures(pe, ~ nValid >= threshold)
+cat("Precursors after 70% completeness filter:", nrow(pe[["precursor_raw"]]), "\n")
+
+# Log transform (base 2)
+pe <- logTransform(pe, i = "precursor_raw", name = "precursor_log")
+
+# Normalize (median centering)
+pe <- normalize(pe, i = "precursor_log", name = "precursor_norm", method = "center.median")
+
+# Aggregate precursors to protein level
+pe <- aggregateFeatures(
+  pe, 
+  i = "precursor_norm", 
+  fcol = "Protein.Ids", 
+  name = "protein",
+  fun = MsCoreUtils::robustSummary
+)
+
+# Identify the number of proteins in the aggregated assay
+num_proteins <- nrow(pe[["protein"]])
+
+cat("Number of unique proteins after aggregation:", num_proteins, "\n")
+```
+
+```{r}
+# Reorder the design
+correct_order <- match(colnames(pe[["precursor_raw"]]), exp_design$Sample)
+ordered_design <- exp_design[correct_order, ]
+
+# Set the row names of the metadata to match the sample names
+rownames(ordered_design) <- ordered_design$Sample
+
+# Assign to colData
+colData(pe) <- DataFrame(ordered_design)
+
+# Verify
+head(colData(pe))
+```
+ 
+```{r}
+# Passage as factor
+pe$passage <- factor(pe$passage, levels = mixedsort(unique(pe$passage)))
+
+head(colData(pe))
+```
+
+```{r}
+# Compare distributions of log-transformed vs. normalized data
+par(mfrow = c(1, 2))
+
+# Before: Log-transformed only
+limma::plotDensities(assay(pe[["precursor_log"]]), 
+                     main = "Before Normalisation", legend = FALSE)
+
+# After: Median Centered
+limma::plotDensities(assay(pe[["precursor_norm"]]), 
+                     main = "After Normalisation", legend = FALSE)
+```
+
+```{r}
+#Boxplots for all log-transformed samples
+boxplot(assay(pe[["precursor_log"]]), 
+        main = "Log Intensities", 
+        las = 2, col = "skyblue", cex.axis = 0.7)
+abline(h = 0, col = "red", lwd = 2) # The median should sit on 0
+```
+
+```{r}
+# Boxplots for all normalized samples
+boxplot(assay(pe[["precursor_norm"]]), 
+        main = "Normalized Intensities", 
+        las = 2, col = "skyblue", cex.axis = 0.7)
+abline(h = 0, col = "red", lwd = 2) # The median should sit on 0
+
+```
+
+
+```{R}
+# =============================================================================
+
+# 5. PCA PLOTS
+
+# =============================================================================
+
+# Perform QRILC imputation on the "protein" assay
+pe <- impute(pe, i = "protein", method = "QRILC", name = "protein_qrilc")
+
+# Extract the complete matrix for PCA
+mat_pca_imp <- assay(pe, "protein_qrilc")
+
+ 
+# PCA
+
+pca     <- prcomp(t(mat_pca_imp), scale. = TRUE, center = TRUE)
+
+pct_var <- round(summary(pca)$importance[2, ] * 100, 1)
+ 
+pca_df <- as.data.frame(pca$x) %>%
+
+  rownames_to_column("Sample") %>%
+
+  left_join(dplyr::select(exp_design, Sample, passage, Replicate),
+
+            by = "Sample")
+ 
+# color palette
+
+nrofpassages <- max(exp_design$passage_nr, na.rm = TRUE)
+pal_passages <- setNames(scales::hue_pal()((nrofpassages+2)), paste0("P", 0:(nrofpassages+1)))
+
+#labeling 
+
+passage_levels <- paste0("P", 0:(nrofpassages+1))
+
+pca_df$passage <- factor(pca_df$passage, levels = passage_levels)
+```
+
+```{r}
+# PC1 vs PC2
+
+p_pca12 <- ggplot(pca_df,
+
+                  aes(x = PC1, y = PC2, color = passage, label = paste0(passage, ".", Replicate))) +
+
+  geom_point(size = 4, alpha = 0.9) +
+
+  geom_text_repel(size = 2.8, max.overlaps = 30, show.legend = FALSE) +
+
+  stat_ellipse(aes(group = passage), type = "norm",
+
+               linetype = "dashed", alpha = 0.35, show.legend = FALSE) +
+
+  scale_color_manual(values = pal_passages, name = "Passage") +
+
+  labs(
+
+    title    = paste0("PCA – ", cells),
+
+    subtitle = sprintf("%d proteins  |  %d samples",
+
+                       nrow(mat_pca_imp), ncol(mat_pca_imp)),
+
+    x = sprintf("PC1 (%.1f%%)", pct_var[1]),
+
+    y = sprintf("PC2 (%.1f%%)", pct_var[2])
+
+  ) +
+
+  theme_bw(base_size = 13) +
+
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+
+p_pca12
+
+```
+
+```{r}
+# PC1 vs PC3
+
+p_pca13 <- ggplot(pca_df,
+
+                  aes(x = PC1, y = PC3, color = passage, label = paste0(passage, ".", Replicate))) +
+
+  geom_point(size = 4, alpha = 0.9) +
+
+  geom_text_repel(size = 2.8, max.overlaps = 30, show.legend = FALSE) +
+
+  stat_ellipse(aes(group = passage), type = "norm",
+
+               linetype = "dashed", alpha = 0.35, show.legend = FALSE) +
+
+  scale_color_manual(values = pal_passages, name = "Passage") +
+
+  labs(
+
+    title    = paste0("PCA – ", cells),
+
+    subtitle = sprintf("%d proteins  |  %d samples",
+
+                       nrow(mat_pca_imp), ncol(mat_pca_imp)),
+    x = sprintf("PC1 (%.1f%%)", pct_var[1]),
+
+    y = sprintf("PC3 (%.1f%%)", pct_var[3])) +
+
+  theme_bw(base_size = 13) +
+
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+
+p_pca13
+
+```
+
+```{r}
+# Scree plot
+
+scree_df <- data.frame(
+
+  PC  = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)),
+
+  Var = pct_var[1:10]
+
+)
+
+p_scree <- ggplot(scree_df, aes(x = PC, y = Var)) +
+
+  geom_col(fill = "steelblue", alpha = 0.8) +
+
+  geom_line(aes(group = 1), color = "firebrick", linewidth = 0.8) +
+
+  geom_point(color = "firebrick", size = 2) +
+
+  labs(title = paste0("Scree plot ", cells), x = NULL, y = "Variance explained (%)") +
+
+  theme_bw(base_size = 12) +
+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_scree
+
+```
+
+```{r}
+# Get loadings of PCs 1, 2, and 3
+
+pc1_vals <- pca$rotation[, "PC1"]
+
+pc1_drivers_high <- head(sort(pc1_vals, decreasing = TRUE), 10)
+pc1_drivers_low <- head(sort(pc1_vals, decreasing = FALSE), 10)
+
+pc2_vals <- pca$rotation[, "PC2"]
+pc2_drivers_high <- head(sort(pc2_vals, decreasing = TRUE), 10)
+pc2_drivers_low <- head(sort(pc2_vals, decreasing = FALSE), 10)
+
+pc3_vals <- pca$rotation[, "PC3"]
+pc3_drivers_high <- head(sort(pc3_vals, decreasing = TRUE), 10)
+pc3_drivers_low <- head(sort(pc3_vals, decreasing = FALSE), 10)
+
+all_drivers_pc1 <- c(names(pc1_drivers_high), names(pc1_drivers_low))
+all_drivers_pc2 <- c(names(pc2_drivers_high), names(pc2_drivers_low))
+all_drivers_pc3 <- c(names(pc3_drivers_high), names(pc3_drivers_low))
+
+# save pc drivers to txt
+writeLines(all_drivers_pc1, con = paste0(output_folder, "/driverspc1_", CMBnr, ".txt"))
+writeLines(all_drivers_pc2, con = paste0(output_folder, "/driverspc2_", CMBnr, ".txt"))
+writeLines(all_drivers_pc3, con = paste0(output_folder, "/driverspc3_", CMBnr, ".txt"))
+
+```
+
+```{r}
+# =============================================================================
+ 
+# 6. tSNE PLOT
+ 
+# =============================================================================
+
+n_samples      <- ncol(mat_pca_imp)
+perplexity_val <- 10
+ 
+set.seed(42)
+tsne_result <- Rtsne(t(mat_pca_imp), 
+                     perplexity = perplexity_val, 
+                     verbose    = TRUE,
+                     pca        = TRUE,   
+                     check_duplicates = FALSE)
+ 
+tsne_df <- data.frame(
+  tSNE1 = tsne_result$Y[, 1],
+  tSNE2 = tsne_result$Y[, 2]
+) %>%
+  mutate(Sample = colnames(mat_pca_imp)) %>%
+  left_join(dplyr::select(exp_design, Sample, passage, Replicate), by = "Sample")
+ 
+tsne_df$passage <- factor(tsne_df$passage, levels = passage_levels)
+ 
+p_tsne <- ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, 
+                               color = passage, 
+                               label = paste0(passage, ".", Replicate))) +
+  geom_point(size = 4, alpha = 0.9) +
+  geom_text_repel(size = 2.8, max.overlaps = 30, show.legend = FALSE) +
+  scale_color_manual(values = pal_passages, name = "Passage") +
+  labs(
+    title    = paste0("tSNE – ", cells),
+    subtitle = sprintf("%d proteins  |  %d samples",
+                       nrow(mat_pca_imp), ncol(mat_pca_imp)),
+    x = "tSNE 1",
+    y = "tSNE 2"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+ 
+p_tsne
+```
+
+```{r}
+# =============================================================================
+
+# 7. VARIANCE PARTITION
+
+# =============================================================================
+
+# Prepare data for VariancePartition
+metadata_xl <- read_excel(paste0("Datasets/",CMBnr,"/extra_metadata.xlsx")) %>%
+  mutate(Sample = as.character(Sample)) %>%
+  dplyr::select(-Injection_Order)   # zit al in exp_design, voorkom dubbele kolom bij de join
+
+mat_vp <- mat_pca_imp
+
+info_vp <- exp_design %>%
+  left_join(metadata_xl, by = "Sample")
+
+
+# set the row names using the 'sample' column
+rownames(info_vp) <- info_vp$Sample
+
+# remove the 'sample' column so only numeric data remains
+info_vp$Sample <- NULL
+
+info_vp <- info_vp %>%
+  mutate(across(c(passage, operator, splitting_ratio), as.factor),
+         Injection_Order = as.numeric(as.character(Injection_Order)))
+
+```
+
+```{r}
+# Define formula for VariancePartition
+form <- ~ (1 | passage) + (1 | operator) + (1 | splitting_ratio) + Injection_Order
+
+```
+
+```{r}
+varPart <- fitExtractVarPartModel(mat_vp, form, info_vp)
+
+# Sort variables (i.e. columns) by median fraction of variance explained
+vp <- sortCols(varPart)
+
+# Violin plot of contribution of each variable to total variance
+vpplot <- plotVarPart(vp)
+
+# Add title
+vpplot <- vpplot + 
+  ggtitle(paste0("Variance Partition Cell Line ", cells)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 18, face = "bold"))
+vpplot
+```
+
+```{r}
+# Calculate the median percentage of variance explained for each variable
+vp_summary <- colMeans(varPart) * 100
+vp_medians <- apply(varPart, 2, median) * 100
+
+# Combine into a clean table
+summary_table_vp <- data.frame(
+  Variable = names(vp_summary),
+  Median_Percent = round(vp_medians, 2)
+) %>%
+  arrange(desc(Median_Percent))
+
+print(summary_table_vp)
+```
+```{r}
+# Canonical correlation analysis between all covariates in the model
+
+form_cor <- ~ passage + operator + splitting_ratio + Injection_Order
+
+C <- canCorPairs(form_cor, info_vp)
+print(C)
+
+png(file.path(output_folder, paste0("collinearity_heatmap_", CMBnr, ".png")), 
+    width = 2000, height = 1600, res = 200)
+plotCorrMatrix(C)
+dev.off()
+
+```
+```{r}
+# =============================================================================
+
+# 8. DIFFERENTIAL EXPRESSION ANALYSIS
+
+# =============================================================================
+
+# --- TREND ANALYSIS BRANCH ---
+pe_trend <- pe
+
+# Determine the second-to-last passage dynamically
+all_passages <- sort(unique(colData(pe_trend)$passage_nr))
+max_passage  <- max(all_passages)
+second_to_last <- all_passages[length(all_passages) - 1]
+
+# Subset 'pe_trend' to keep only passage 1 up to the second-to-last passage
+keep_samples <- colData(pe_trend)$passage_nr >= 1 & 
+  colData(pe_trend)$passage_nr <= second_to_last
+
+pe_trend <- pe_trend[, keep_samples, ]
+
+# Fit the model and perform hypothesis testing on the subsetted data
+pe_trend <- msqrob(pe_trend, i = "protein", formula = ~passage_nr, overwrite = TRUE)
+
+L_trend <- makeContrast("passage_nr = 0", 
+                        parameterNames = colnames(model.matrix(~passage_nr, colData(pe_trend))))
+
+pe_trend <- hypothesisTest(pe_trend, i = "protein", contrast = L_trend)
+
+# --- PAIRWISE ANALYSIS BRANCH ---
+pe_pair <- pe
+pe_pair <- msqrob(pe_pair, i = "protein", formula = ~passage, overwrite = TRUE)
+
+contrast_name <- paste0("passage", passage_of_interest)
+contrast_str  <- paste0(contrast_name, " = 0")
+
+L_pair <- makeContrast(contrast_str,
+                       parameterNames = colnames(model.matrix(~passage, colData(pe_pair))))
+pe_pair <- hypothesisTest(pe_pair, i = "protein", contrast = L_pair)
+
+```
+
+```{r}
+# Extract Pairwise
+gene_lookup <- as.data.frame(rowData(pe_pair[[1]])) %>% 
+  dplyr::select(Protein.Ids, Genes) %>%
+  distinct()
+
+res_pair <- rowData(pe_pair[["protein"]])[[contrast_name]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein.Ids") %>%
+  left_join(gene_lookup, by = "Protein.Ids") %>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", Protein.Ids, Genes)) %>%
+  mutate(Protein = Protein.Ids)
+
+# --- VOLCANO PLOT ---
+p_cutoff <- 0.05
+fc_cutoff <- 1
+
+plot_title <- paste("Volcano Plot: Cell Line", cells, passage_of_interest, "vs", passage_baseline)
+
+p_volcano <- ggplot(res_pair, aes(x = logFC, y = -log10(adjPval))) +
+  geom_point(aes(color = (adjPval < p_cutoff & abs(logFC) > fc_cutoff)), alpha = 0.5) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed") +
+  geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed") +
+  geom_text_repel(
+    data = res_pair %>% filter(adjPval < p_cutoff & abs(logFC) > fc_cutoff),
+    aes(label = Genes),
+    size = 3,
+    max.overlaps = 12
+  ) +
+  theme_classic() +
+  labs(title = plot_title,
+       x = "Log2 Fold Change", y = "-log10(Adjusted P-value)",
+       color = "Significant") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"))
+
+print(p_volcano)
+```
+```{r}
+# Extract Trend (Slope across all passages)
+res_trend <- rowData(pe_trend[["protein"]])$passage_nr %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein.Ids") %>%
+  left_join(gene_lookup, by = "Protein.Ids") %>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", Protein.Ids, Genes))
+
+# --- HEATMAP --- 
+
+# 1. Filter for ALL differentially expressed proteins (adjPval < 0.05)
+sig_trend_data <- res_trend %>%
+  filter(adjPval < 0.05) %>%
+  arrange(adjPval)
+
+sig_trend_ids <- sig_trend_data$Protein.Ids
+
+# 2. Extract and format matrix
+heatmap_data <- assay(pe_trend[["protein"]])[sig_trend_ids, ]
+
+# Order columns by passage number so the trend displays chronologically
+col_order <- order(colData(pe_trend)$passage_nr)
+heatmap_data <- heatmap_data[, col_order]
+
+# Format column names
+colnames(heatmap_data) <- paste0("P", colData(pe_trend)$passage_nr[col_order],
+                                 "_",
+                                 sub(".*_", "", rownames(colData(pe_trend))[col_order]))
+
+# 3. Z-score scale across rows (proteins)
+heatmap_scaled <- t(scale(t(heatmap_data)))
+
+# 4. Generate High-Density Heatmap
+# Cut the proteins into 4 main trend clusters to give the dendrogram meaning
+p_heatmap <- pheatmap(
+  heatmap_scaled,
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  cutree_rows = 2,             # Splits dendrogram into 3 logical expression clusters
+  treeheight_row = 30,         # Shrinks dendrogram width so it doesn't overpower the plot
+  show_colnames = TRUE,
+  show_rownames = FALSE,
+  border_color = NA,
+  color = viridis(100),
+  main = "Longitudinal Trend Differentially Expressed Proteins of Cell Line NCI_H1650",
+  angle_col = 90,              # Rotates x-axis labels to 90 degrees for better readability
+  use_raster = TRUE,           # Removes white line rendering artifacts
+  legend_breaks = c(-4, -2, 0, 2),
+  legend_labels = c("-4", "-2", "0", "2 (Z-score)") # Explicitly labels the scale
+)
+
+print(p_heatmap)
+
+```
+
+```{r}
+# Trend and pairwise DEA results
+
+df_trend <- res_trend %>%
+  select(Gene = Genes, logFC_trend = logFC, pval_trend = adjPval) %>%
+  mutate(Gene = trimws(as.character(Gene)))
+
+df_pair <- res_pair %>%
+  select(Gene = Genes, logFC_pair = logFC, pval_pair = adjPval) %>%
+  mutate(Gene = trimws(as.character(Gene)))
+
+# --- CLASSIFY & FILTER EACH ANALYSIS SEPARATELY ---
+
+# --- Trend analysis ---
+trend_table <- df_trend %>%
+  mutate(
+    sig_trend = pval_trend < 0.05,
+    Status = case_when(
+      pval_trend < 0.05 & logFC_trend > 0 ~ "Trend Up",
+      pval_trend < 0.05 & logFC_trend < 0 ~ "Trend Down",
+      TRUE ~ "Not Significant"
+    )
+  ) %>%
+  filter(sig_trend) %>%
+  select(Gene, logFC_trend, pval_trend, Status)
+
+# --- Pairwise analysis ---
+pair_table <- df_pair %>%
+  mutate(
+    sig_pair = pval_pair < 0.05 & abs(logFC_pair) > fc_cutoff,
+    Status = case_when(
+      pval_pair < 0.05 & logFC_pair >  fc_cutoff ~ "Upregulated",
+      pval_pair < 0.05 & logFC_pair < -fc_cutoff ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  ) %>%
+  filter(sig_pair) %>%
+  select(Gene, logFC_pair, pval_pair, Status)
+
+# --- UNIQUE SIGNIFICANT PROTEIN LISTS (PER ANALYSIS) ---
+trend_sig_proteins <- trend_table %>% pull(Gene) %>% unique()
+pair_sig_proteins  <- pair_table  %>% pull(Gene) %>% unique()
+
+# Background set for STRING enrichment analysis 
+background_list <- rownames(pe_pair[["protein"]])
+
+```
+```{r}
+cat("\n--- Pairwise detailed count ---\n")
+
+cat("Significant rows:", nrow(pair_table), "\n")
+
+cat("Upregulated rows:",
+    sum(pair_table$Status == "Upregulated"), "\n")
+
+cat("Downregulated rows:",
+    sum(pair_table$Status == "Downregulated"), "\n")
+
+cat("Unique significant genes:",
+    n_distinct(pair_table$Gene), "\n")
+
+cat("Unique upregulated genes:",
+    n_distinct(pair_table$Gene[pair_table$Status == "Upregulated"]), "\n")
+
+cat("Unique downregulated genes:",
+    n_distinct(pair_table$Gene[pair_table$Status == "Downregulated"]), "\n")
+```
+```{r}
+cat("\n--- Trend detailed count ---\n")
+
+cat("Significant rows:", nrow(trend_table), "\n")
+
+cat("Upregulated rows:",
+    sum(trend_table$Status == "Trend Up"), "\n")
+
+cat("Downregulated rows:",
+    sum(trend_table$Status == "Trend Down"), "\n")
+
+cat("Unique significant genes:",
+    n_distinct(trend_table$Gene), "\n")
+
+cat("Unique upregulated genes:",
+    n_distinct(trend_table$Gene[trend_table$Status == "Trend Up"]), "\n")
+
+cat("Unique downregulated genes:",
+    n_distinct(trend_table$Gene[trend_table$Status == "Trend Down"]), "\n")
+```
+
+```{r}
+# =============================================================================
+
+# 9. EXPORTING
+
+# =============================================================================
+
+# --- EXPORT TAG---
+tag <- paste0(passage_of_interest, "_vs_", passage_baseline)
+
+# --- DEFINE OUTPUT PATHS ---
+base_dir  <- paste0("Datasets/results/", CMBnr, "/", tag)
+plot_dir  <- paste0(base_dir, "/plots")
+dea_dir   <- paste0(base_dir, "/dea_lists")
+
+# --- CREATE FOLDERS IF THEY DON'T EXIST ---
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(dea_dir,  recursive = TRUE, showWarnings = FALSE)
+
+# --- SAVING PLOTS ---
+png(paste0(plot_dir, "/Volcano_", tag, ".png"),
+    width = 10, height = 8, units = "in", res = 300)
+print(p_volcano)
+dev.off()
+
+png(paste0(plot_dir, "/Heatmap_Trend_", CMBnr, ".png"),
+    width = 12, height = 14, units = "in", res = 300)
+print(p_heatmap)
+dev.off()
+
+ggsave(file.path(output_folder, paste0("pca12_", CMBnr, ".png")), p_pca12, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("pca13_", CMBnr, ".png")), p_pca13, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("scree_", CMBnr, ".png")), p_scree, width = 10, height = 5)
+ggsave(file.path(output_folder, paste0("vpplot_", CMBnr, ".png")), vpplot, width = 8, height = 7)
+ggsave(file.path(output_folder, paste0("tsne_", CMBnr, ".png")), p_tsne, width = 8, height = 7)
+
+
+
+cat(paste0("Plots saved as png\n"), create.dir = TRUE)
+
+## Trend analysis exports
+write_lines(trend_sig_proteins, paste0(dea_dir,"/cytoscape_query_proteins_trend.txt"))
+write_tsv(trend_table, paste0(dea_dir, "/cytoscape_node_attributes_trend.tsv"))
+ 
+## Pairwise analysis exports
+write_lines(pair_sig_proteins, paste0(dea_dir,"/cytoscape_query_proteins_pair.txt"))
+write_tsv(pair_table, paste0(dea_dir, "/cytoscape_node_attributes_pair.tsv"))
+ 
+## Optional shared background list for STRING App enrichment baseline
+write_lines(background_list, paste0(dea_dir, "/cytoscape_background_proteins.txt"))
+
+# --- SAVE PROTEIN INTENSITIES ---
+# Extract the intensity matrix
+export_table <- assay(pe, "protein")
+
+# Transpose so proteins = rows, samples = columns
+export_table <- t(export_table)
+
+# Save to CSV
+write.csv(export_table, paste0("Datasets/results/", CMBnr,"/Protein_Intensities_Wide.csv"), row.names = TRUE)
+
+```

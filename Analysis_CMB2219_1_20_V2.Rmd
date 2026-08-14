@@ -1285,8 +1285,7 @@ krt_data <- prot_mat[
 # ------------------------------------------------------------
 # 3. Add experimental metadata
 # ------------------------------------------------------------
-# Change 'experimental_design' below if your lookup table has
-# another object name.
+
 
 krt_data <- krt_data %>%
   left_join(
